@@ -19,10 +19,13 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "fatfs.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_cdc_if.h"
+#include <string.h>
+#include<stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,6 +47,7 @@
 SPI_HandleTypeDef hspi2;
 
 /* USER CODE BEGIN PV */
+uint8_t dbg_rt = 0xFF, dbg_token = 0xFF;
 uint8_t sector[512];
 /* USER CODE END PV */
 
@@ -83,6 +87,102 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc)
 	return 0xFF; //10次都沒回答，回傳0xFF表示失敗
 }
 
+
+// 叫醒並初始化 SD 卡。成功回傳 0；失敗回傳 1~4，代表卡在第幾步
+static int sd_init(void)
+{
+    uint8_t r, buf[4];
+
+    SD_CS_HIGH();
+    for (int i = 0; i < 10; i++) spi_xchg(0xFF);      // 搖醒
+
+    HAL_Delay(10);                                    // 等卡的電源穩定
+    for (int t = 0; t < 10; t++) {                    // CMD0：最多試 10 次
+        SD_CS_LOW();
+        r = sd_send_cmd(0, 0, 0x95);
+        SD_CS_HIGH(); spi_xchg(0xFF);
+        if (r == 0x01) break;
+    }
+    if (r != 0x01) return 1;
+
+    SD_CS_LOW();                                      // CMD8：新型卡嗎？
+    r = sd_send_cmd(8, 0x1AA, 0x87);
+    for (int i = 0; i < 4; i++) buf[i] = spi_xchg(0xFF);
+    SD_CS_HIGH(); spi_xchg(0xFF);
+    if (r != 0x01 || buf[2] != 0x01 || buf[3] != 0xAA) return 2;
+
+    for (int i = 0; i < 1000; i++) {                  // ACMD41：準備好了沒？
+        SD_CS_LOW(); sd_send_cmd(55, 0, 0x01); SD_CS_HIGH(); spi_xchg(0xFF);
+        SD_CS_LOW(); r = sd_send_cmd(41, 0x40000000, 0x01); SD_CS_HIGH(); spi_xchg(0xFF);
+        if (r == 0x00) break;
+        HAL_Delay(1);
+    }
+    if (r != 0x00) return 3;
+
+    SD_CS_LOW();                                      // CMD58：大容量卡嗎？
+    sd_send_cmd(58, 0, 0x01);
+    for (int i = 0; i < 4; i++) buf[i] = spi_xchg(0xFF);
+    SD_CS_HIGH(); spi_xchg(0xFF);
+    if ((buf[0] & 0x40) == 0) return 4;
+
+    return 0;                                         // 全部成功
+}
+
+// 讀第 n 頁，放進 dst 指向的 512 格陣列。成功回傳 0，失敗回傳 1
+static int sd_read_sector(uint32_t n, uint8_t *dst)
+{
+    uint8_t token = 0xFF;
+    SD_CS_LOW();
+    if (sd_send_cmd(17, n, 0x01) == 0x00) {
+        for (int i = 0; i < 2000; i++) {              // 等公車
+            token = spi_xchg(0xFF);
+            if (token == 0xFE) break;
+        }
+        if (token == 0xFE) {                          // 上車收資料
+            for (int i = 0; i < 512; i++) dst[i] = spi_xchg(0xFF);
+            spi_xchg(0xFF); spi_xchg(0xFF);           // 檢查碼丟掉
+        }
+    }
+    SD_CS_HIGH(); spi_xchg(0xFF);
+    return (token == 0xFE) ? 0 : 1;
+}
+
+// 把 src 指向的 512 個位元組寫到第 n 頁。成功回傳 0，失敗回傳 1
+static int sd_write_sector(uint32_t n, const uint8_t *src)
+{
+    int ok = 0;
+    SD_CS_LOW();
+    if (sd_send_cmd(24, n, 0x01) == 0x00) {
+        // ① 送一個 0xFF，再送 0xFE
+        spi_xchg(0xFF);
+	spi_xchg(0xFE);
+
+ 	// ② 用迴圈送 512 個位元組：src[i]
+        for(int i=0;i<512;i++){
+		spi_xchg(src[i]);
+	}
+	// ③ 送兩個 0xFF（檢查碼）
+        spi_xchg(0xFF);
+	spi_xchg(0xFF);
+
+	// ④ 收回應位元組：resp = spi_xchg(0xFF)
+	uint8_t resp = spi_xchg(0xFF);
+
+	// ⑤ 如果 (resp & 0x1F) == 0x05：
+        //      用迴圈一直收，直到收到 0xFF（最多 100000 次）
+        //      收到 0xFF 就把 ok 設成 1
+	if((resp & 0x1F) == 0x05){
+		for(int i=0;i<100000;i++){
+			if(spi_xchg(0xFF)== 0xFF){
+				ok=1;
+				break;
+				}
+			}
+		}
+    }
+    SD_CS_HIGH(); spi_xchg(0xFF);
+    return ok ? 0 : 1;
+}
 /* USER CODE END 0 */
 
 /**
@@ -116,96 +216,16 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI2_Init();
   MX_FATFS_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-  SD_CS_HIGH();
-  for(int i=0;i<10;i++){
-	  spi_xchg(0xFF);
-  }
+  int init_result = sd_init();
 
-  SD_CS_LOW();
-  uint8_t r=sd_send_cmd(0,0,0x95);
-  SD_CS_HIGH();
-  spi_xchg(0xFF);
+  memset(sector, 0, 512);
+  strcpy((char*)sector, "Hello SD card from STM32!");
+  int write_result = sd_write_sector(20000, sector);
 
-  if(r == 0x01){
-	  SD_CS_LOW();
-	  r = sd_send_cmd(8, 0x000001AA, 0x87);
-	  uint8_t buf[4];
-
-	  for(int i=0;i<4;i++){
-		  buf[i]=spi_xchg(0xFF);
-	  }
-	  SD_CS_HIGH();
-	  spi_xchg(0xFF);
-
-	  if(r==0x01 && buf[2]==0x01 && buf[3]==0xAA){
-		  uint8_t ans=0xFF;
-		  for(int i=0;i<1000;i++){
-			  SD_CS_LOW();
-			  sd_send_cmd(55,0,0x01);
-			  SD_CS_HIGH();
-			  spi_xchg(0xFF);
-
-			  SD_CS_LOW();
-			  ans = sd_send_cmd(41,0x40000000,0x01);
-			  SD_CS_HIGH();
-			  spi_xchg(0xFF);
-
-			  if(ans == 0x00)break;
-			  else HAL_Delay(1);
-		  }
-		  if(ans == 0x00){
-			  SD_CS_LOW();
-			  sd_send_cmd(58,0,0x81);
-			  for(int i=0;i<4;i++){
-				  buf[i] = spi_xchg(0xFF);
-			  }
-			  SD_CS_HIGH();
-			  spi_xchg(0xFF);
-			  if((buf[0] & 0x40)!=0){
-				  SD_CS_LOW();
-				  uint8_t rt = sd_send_cmd(17,0,0x81);
-				  uint8_t token = 0xFF;
-				  if(rt==0x00){
-					  for(int i=0;i<2000;i++){
-						  token = spi_xchg(0xFF);
-						  if(token == 0xFE)break;
-					  }
-					  if(token == 0xFE){
-						  for(int i=0;i<512;i++){
-							  sector[i] = spi_xchg(0xFF);
-						  }
-						  spi_xchg(0xFF);
-						  spi_xchg(0xFF);
-					  }
-				  }
-
-				  SD_CS_HIGH();
-				  spi_xchg(0xFF);
-
-				  if(token == 0xFE && sector[510] == 0x55 && sector[511] == 0xAA){
-					  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-					  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-				  }
-				  else{
-					  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-				  }
-
-			  }
-			  else{
-				  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-			  }
-		  }
-		  else{
-			  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-		  }
-	  }
-	  else  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-  }
-  else{
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-  }
-
+  memset(sector, 0, 512);
+  int read_result = sd_read_sector(20000, sector);   // 讀第 0 頁（答案已知，方便驗證）
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -215,6 +235,24 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    HAL_Delay(2000);
+    char line[64];
+
+    // 先印出 rt 和 token
+    int m = snprintf(line, sizeof(line), "init=%d write=%d read=%d\r\n", init_result, write_result, read_result);
+    CDC_Transmit_FS((uint8_t*)line, m);
+    HAL_Delay(5);
+
+    // 再印 hex dump
+    for (int row = 0; row < 32; row++) {
+        int n = snprintf(line, sizeof(line), "%03X: ", row * 16);
+        for (int col = 0; col < 16; col++) {
+            n += snprintf(line + n, sizeof(line) - n, "%02X ", sector[row * 16 + col]);
+        }
+        n += snprintf(line + n, sizeof(line) - n, "\r\n");
+        CDC_Transmit_FS((uint8_t*)line, n);
+        HAL_Delay(5);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -236,10 +274,14 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -249,12 +291,12 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
@@ -311,6 +353,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
